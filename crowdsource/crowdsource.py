@@ -725,6 +725,9 @@ def refit_psf_from_stamps(psf, x, y, xcen, ycen, stamps):
         else:
             xnew = x
             ynew = y
+    else:
+        xnew = x
+        ynew = y
     return psf, xnew, ynew
 
 
@@ -752,21 +755,49 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
     roughfwhm = psfmod.neff_fwhm(psf(im.shape[0]//2, im.shape[1]//2))
     roughfwhm = numpy.max([roughfwhm, 3.])
 
+    if weight is not None:
+        errim = weight.copy()*0+1e30
+        errim[weight>0] = 1/numpy.sqrt(weight[weight>0])
+
+    import time
+    import sep
+
     while True:
         titer += 1
-        hsky = sky_im(im-model, weight=weight, npix=20)
-        lsky = sky_im(im-model, weight=weight, npix=50*roughfwhm)
+        t0 = time.time()
+        #hsky = sky_im(im-model, weight=weight, npix=20)
+        #lsky = sky_im(im-model, weight=weight, npix=50*roughfwhm)
+        if dq is not None:
+            hsky = sep.Background(im, mask=(dq>0), bw=20, bh=20, fw=3, fh=3).back()
+            lsky = sep.Background(im, mask=(dq>0), bw=50*roughfwhm, bh=50*roughfwhm, fw=3, fh=3).back()
+        else:
+            hsky = sep.Background(im, bw=20, bh=20, fw=3, fh=3).back()
+            lsky = sep.Background(im, bw=50*roughfwhm, bh=50*roughfwhm, fw=3, fh=3).back()
+        print('sky = '+str(time.time()-t0))
         if titer != lastiter:
             # in first passes, do not split sources!
             blendthresh = 2 if titer < 2 else 0.2
-            xn, yn = peakfind(im-model-hsky,
-                              model-msky, weight, dq, psf,
-                              keepsat=(titer == 0),
-                              blendthreshold=blendthresh,
-                              threshold=threshold)
+            t1 = time.time()
+            #import pdb; pdb.set_trace()
+            filtkern = psf.stamp
+            filtkern /= numpy.sum(filtkern)
+            #catn = sep.extract(im-model-hsky,threshold,err=errim,filter_kernel=filtkern,filter_type='matched')
+            catn = sep.extract(im-model-hsky,threshold,err=errim)
+            xn = numpy.round(catn['y'])  # crowsource calls the 1st dimension X even though they are the rows
+            yn = numpy.round(catn['x'])  # expects integers
+            #import pdb; pdb.set_trace()
+            #xn, yn = peakfind(im-model-hsky,
+            #                  model-msky, weight, dq, psf,
+            #                  keepsat=(titer == 0),
+            #                  blendthreshold=blendthresh,
+            #                  threshold=threshold)
+            #import pdb; pdb.set_trace()
+            print('peakfind = '+str(time.time()-t1))
             if len(xa) > 0 and len(xn) > 0:
+                t2 = time.time()
                 keep = neighbor_dist(xn, yn, xa, ya) > 1.5
                 xn, yn = (c[keep] for c in (xn, yn))
+                print('neighbor_dist = '+str(time.time()-t2))
             if (titer == 0) and (blist is not None):
                 xnb, ynb = add_bright_stars(xn, yn, blist, im)
                 xn = numpy.concatenate([xn, xnb]).astype('f4')
@@ -784,7 +815,9 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
                 lastiter = titer + 1
         # we probably don't want the sizes to change very much.  hsky certainly
         # will change a bit from iteration to iteration, though.
+        t2 = time.time()
         sz = get_sizes(xa, ya, im-hsky-msky, weight=weight, blist=blist)
+        print('get_sizes = '+str(time.time()-t2))
         if guessflux is not None:
             guess = numpy.concatenate([guessflux, numpy.zeros_like(xn)])
         else:
@@ -820,10 +853,12 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
             guesssky = skypar.get((bdxf, bdyf))
             guessmbda = (numpy.concatenate([guessmbda, guesssky])
                          if guessmbda is not None else None)
+            t3 = time.time()
             tflux, tmodel, tmsky = fit_once(
                 im[sall]-sky[sall], xa[mbda]-bdxaf, ya[mbda]-bdyaf, psfsbda,
                 psfderiv=tpsfderiv, weight=weightbda, guess=guessmbda,
                 nskyx=nskyx, nskyy=nskyy)
+            print('fit_once = '+str(time.time()-t3))
             model[spri] = tmodel[sfit]
             msky[spri] = tmsky[sfit]
             ind = numpy.flatnonzero(mbd)
@@ -844,24 +879,32 @@ def fit_im(im, psf, weight=None, dq=None, psfderiv=True,
             import gc
             gc.collect()
 
+        t4 = time.time()
         centroids = compute_centroids(xa, ya, psfs, flux, im-(sky+msky),
                                       im-model-sky,
                                       weight, derivcentroids=derivcentroids)
+        print('centroids = '+str(time.time()-t4))
 
         xcen, ycen, stamps = centroids
         if titer == lastiter:
+            t5 = time.time()
             stats = compute_stats(xa-numpy.round(xa), ya-numpy.round(ya),
                                   stamps[0], stamps[2],
                                   stamps[3], stamps[1],
                                   flux)
+            print('compute stats = '+str(time.time()-t5))
+            t6 = time.time()
             if dq is not None:
                 stats['flags'] = extract_im(xa, ya, dq).astype('i4')
             stats['sky'] = extract_im(xa, ya, sky+msky).astype('f4')
+            print('extract_im = '+str(time.time()-t6))
             break
         guessflux = flux[:len(xa)*repeat:repeat]
         if refit_psf and len(xa) > 0:
+            t7 = time.time()
             psf, xa, ya = refit_psf_from_stamps(psf, xa, ya, xcen, ycen, 
                                                 stamps)
+            print('refit_psf = '+str(time.time()-t7))
         # enforce maximum step
         if derivcentroids:
             maxstep = 1
